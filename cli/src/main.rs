@@ -969,9 +969,15 @@ async fn run_agent(
                 .context("Failed to parse register response JSON")?;
             println!("{}", serde_json::to_string_pretty(&v)?);
 
+            // Backend shape: either { node_id, node_token } or { node: { id }, node_token }.
             let node_id = v
                 .get("node_id")
                 .and_then(|x| x.as_str())
+                .or_else(|| {
+                    v.get("node")
+                        .and_then(|n| n.get("id"))
+                        .and_then(|x| x.as_str())
+                })
                 .context("register response missing node_id")?;
             let node_token = v
                 .get("node_token")

@@ -86,19 +86,46 @@ Validated with `X-Api-Key`:
 
 Evidence (local): `/tmp/quiltc_cluster_session1_path.txt`, `/tmp/quiltc_cluster_tenant_session_path.txt`
 
-## What Remains To Verify For A Full “Kubernetes Session”
+## Full “Kubernetes-Like” Cluster Management Session
 
-To be equivalent to “kubectl apply deployment; scheduler assigns; kubelet/agent materializes; status is reported”, we still need one live run that includes:
+In addition to exercising the tenant control-plane CRUD endpoints, a full session was run that mirrors the Kubernetes control loop:
 
-- Agent bootstrap + node registration:
-  - `POST /api/agent/clusters/:cluster_id/nodes/register` (requires `QUILT_AGENT_KEY`)
-  - `POST /api/agent/clusters/:cluster_id/nodes/:node_id/heartbeat` (requires node token)
-  - `GET /api/agent/clusters/:cluster_id/nodes/:node_id/placements` (agent fetches assignments)
-  - `POST /api/agent/clusters/:cluster_id/nodes/:node_id/placements/:placement_id/report` (agent reports status + container_id)
-  - `POST /api/agent/clusters/:cluster_id/nodes/:node_id/deregister` (cleanup)
+- Create a cluster.
+- Register nodes (agent bootstrap key), heartbeat nodes to `ready`.
+- Create a workload with `replicas=3`.
+- Reconcile to generate placements and assign replicas to nodes.
+- Agent fetches placements for its node.
+- Agent materializes placements by creating containers (tenant container runtime) and reports placement status (`running` + `container_id`).
+- Delete a node and reconcile; observe placements rescheduled off the deleted node.
+- Cleanup (delete workload, delete cluster, delete created containers).
 
-Once nodes are registered/ready, we can also validate:
-- `POST /api/clusters/:cluster_id/nodes/:node_id/drain`
-- `DELETE /api/clusters/:cluster_id/nodes/:node_id` (revokes node token)
-- Scheduler behavior: placements created for replicas, scale up/down, and reschedule when a node is deleted.
+Endpoints exercised in this session:
 
+- Agent control-plane:
+  - `POST /api/agent/clusters/:cluster_id/nodes/register`
+  - `POST /api/agent/clusters/:cluster_id/nodes/:node_id/heartbeat`
+  - `GET /api/agent/clusters/:cluster_id/nodes/:node_id/allocation`
+  - `GET /api/agent/clusters/:cluster_id/nodes/:node_id/placements`
+  - `POST /api/agent/clusters/:cluster_id/nodes/:node_id/placements/:placement_id/report`
+  - `POST /api/agent/clusters/:cluster_id/nodes/:node_id/deregister`
+
+- Tenant cluster control-plane:
+  - `POST /api/clusters`
+  - `GET /api/clusters`
+  - `GET /api/clusters/:cluster_id`
+  - `POST /api/clusters/:cluster_id/reconcile`
+  - `GET /api/clusters/:cluster_id/nodes`
+  - `GET /api/clusters/:cluster_id/nodes/:node_id`
+  - `POST /api/clusters/:cluster_id/nodes/:node_id/drain`
+  - `DELETE /api/clusters/:cluster_id/nodes/:node_id`
+  - `POST /api/clusters/:cluster_id/workloads`
+  - `GET /api/clusters/:cluster_id/workloads`
+  - `GET /api/clusters/:cluster_id/workloads/:workload_id`
+  - `PUT /api/clusters/:cluster_id/workloads/:workload_id`
+  - `DELETE /api/clusters/:cluster_id/workloads/:workload_id`
+  - `GET /api/clusters/:cluster_id/placements`
+  - `DELETE /api/clusters/:cluster_id`
+
+Evidence (local):
+- Full kube-like session with 2 nodes, 3 replicas, placement reporting, and reschedule: `/tmp/quiltc_kube_session_full_path.txt` (points to capture folder).
+- Node endpoints + allocation + agent placement assignment verification: `/tmp/quiltc_cluster_endpoints_verify2_path.txt` (points to capture folder).
