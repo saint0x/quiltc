@@ -1,6 +1,6 @@
 # quiltc
 
-`quiltc` is a production CLI for Quilt’s backend HTTP API. It is Kubernetes-like in that it drives a desired-state control plane (clusters, nodes, workloads, placements) and a runtime surface (containers, volumes, events) via HTTP.
+`quiltc` is Quilt's Kubernetes-like CLI. It drives a desired-state control plane (clusters, nodes, workloads, placements) and a runtime surface (containers, volumes, events) via HTTP.
 
 See:
 - `RESULTS.md` for live verification evidence and the exact endpoint coverage.
@@ -51,7 +51,7 @@ quiltc clusters join-token-create <cluster_id> --ttl-secs 600 --max-uses 1
 Register a node (repeat per node; join tokens are typically single-use):
 
 ```bash
-QUILT_JOIN_TOKEN=<join_token> quiltc agent register <cluster_id> \\
+quiltc agent register <cluster_id> --join-token <join_token> \\
   --name node-a \\
   --public-ip 203.0.113.10 \\
   --private-ip 10.0.0.10 \\
@@ -137,4 +137,3 @@ For new/experimental endpoints not yet wrapped by a subcommand:
 quiltc request GET /api/clusters
 quiltc request POST /api/clusters/<cluster_id>/join-tokens --json '{\"ttl_secs\":600,\"max_uses\":1}'
 ```
-
