@@ -45,7 +45,7 @@ struct Args {
     #[arg(long)]
     tls_ca: Option<PathBuf>,
 
-    /// Quilt backend base URL (enables HTTP proxy for /api/containers, /api/volumes, /api/auth, /api/api-keys, /api/events)
+    /// Quilt backend base URL (enables HTTP proxy for /api/containers, /api/snapshots, /api/operations, /api/volumes, /api/auth, /api/api-keys, /api/events)
     #[arg(long, env = "QUILT_API_BASE_URL")]
     quilt_api_base_url: Option<String>,
 

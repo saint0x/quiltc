@@ -1,10 +1,11 @@
 mod config;
 mod error;
 mod http_client;
+mod snapshot_types;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use clap::{Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use reqwest::Method;
 use std::fs;
@@ -12,9 +13,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
+use uuid::Uuid;
 
 use crate::config::{default_config_path, node_token_key, Config};
 use crate::http_client::{header_kv, Client, TenantAuth};
+use crate::snapshot_types::{CapabilityMatrix, OperationResponse};
 
 #[derive(Parser, Debug)]
 #[command(name = "quiltc")]
@@ -94,8 +97,27 @@ enum Command {
         cmd: ContainerCmd,
     },
 
+    /// Snapshot lifecycle endpoints
+    Snapshots {
+        #[command(subcommand)]
+        cmd: SnapshotCmd,
+    },
+
+    /// Long-running operation endpoints
+    Operations {
+        #[command(subcommand)]
+        cmd: OperationCmd,
+    },
+
     /// Stream events (SSE)
-    Events,
+    Events {
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long)]
+        snapshot_id: Option<String>,
+        #[arg(long)]
+        container_id: Option<String>,
+    },
 
     /// Make an arbitrary HTTP request (escape hatch for new endpoints)
     Request {
@@ -283,6 +305,9 @@ enum ClusterCmd {
         #[arg(long)]
         max_uses: Option<u64>,
     },
+    Capabilities {
+        cluster_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -409,6 +434,131 @@ enum ContainerCmd {
         #[arg(long)]
         destination: String,
     },
+    Snapshot {
+        id: String,
+        #[command(flatten)]
+        options: LifecycleRequestArgs,
+    },
+    Fork {
+        id: String,
+        #[command(flatten)]
+        options: LifecycleRequestArgs,
+    },
+    Resume {
+        id: String,
+        #[command(flatten)]
+        options: LifecycleRequestArgs,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapshotCmd {
+    List {
+        #[arg(long)]
+        container_id: Option<String>,
+        #[arg(long)]
+        label: Vec<String>,
+    },
+    Get {
+        id: String,
+    },
+    Lineage {
+        id: String,
+    },
+    Delete {
+        id: String,
+        #[command(flatten)]
+        options: MutationControlArgs,
+    },
+    Pin {
+        id: String,
+        #[command(flatten)]
+        options: MutationControlArgs,
+    },
+    Unpin {
+        id: String,
+        #[command(flatten)]
+        options: MutationControlArgs,
+    },
+    Clone {
+        id: String,
+        #[command(flatten)]
+        options: LifecycleRequestArgs,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OperationCmd {
+    Get {
+        operation_id: String,
+    },
+    Watch {
+        operation_id: String,
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+    },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ConsistencyMode {
+    CrashConsistent,
+    AppConsistent,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum NetworkMode {
+    Reset,
+    PreserveNs,
+    PreserveConnBestEffort,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum VolumeMode {
+    Exclude,
+    IncludeNamed,
+    IncludeAllAllowed,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ResumePolicy {
+    Manual,
+    Immediate,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+struct MutationControlArgs {
+    #[arg(long)]
+    idempotency_key: Option<String>,
+    #[arg(long, default_value_t = false)]
+    wait: bool,
+    #[arg(long, default_value_t = 300)]
+    timeout_secs: u64,
+    #[arg(long)]
+    cluster_id: Option<String>,
+    #[arg(long)]
+    require_capability: Vec<String>,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+struct LifecycleRequestArgs {
+    #[arg(long, value_enum, default_value = "crash-consistent")]
+    consistency_mode: ConsistencyMode,
+    #[arg(long, value_enum, default_value = "reset")]
+    network_mode: NetworkMode,
+    #[arg(long, value_enum, default_value = "exclude")]
+    volume_mode: VolumeMode,
+    #[arg(long, value_enum, default_value = "manual")]
+    resume_policy: ResumePolicy,
+    #[arg(long)]
+    placement_hint_json: Option<String>,
+    #[arg(long)]
+    ttl_seconds: Option<u64>,
+    #[arg(long)]
+    label: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+    #[command(flatten)]
+    mutation: MutationControlArgs,
 }
 
 #[tokio::main]
@@ -474,9 +624,16 @@ async fn main() -> Result<()> {
         Command::Volumes { cmd } => run_volumes(&tenant_client, cmd).await,
         Command::Agent { cmd } => run_agent(&agent_client, &mut cfg, &cfg_path, cmd).await,
         Command::Containers { cmd } => run_containers(&tenant_client, cmd).await,
-        Command::Events => {
+        Command::Snapshots { cmd } => run_snapshots(&tenant_client, cmd).await,
+        Command::Operations { cmd } => run_operations(&tenant_client, cmd).await,
+        Command::Events {
+            operation_id,
+            snapshot_id,
+            container_id,
+        } => {
+            let path = build_events_path(operation_id, snapshot_id, container_id);
             tenant_client
-                .stream_to_stdout(Method::GET, "/api/events", Default::default(), None)
+                .stream_to_stdout(Method::GET, &path, Default::default(), None)
                 .await
         }
         Command::Request {
@@ -686,6 +843,16 @@ async fn run_clusters(client: &Client, cmd: ClusterCmd) -> Result<()> {
                     &format!("/api/clusters/{}/join-tokens", cluster_id),
                     Default::default(),
                     Some(body),
+                )
+                .await
+        }
+        ClusterCmd::Capabilities { cluster_id } => {
+            client
+                .send_json(
+                    Method::GET,
+                    &format!("/api/clusters/{}/capabilities", cluster_id),
+                    Default::default(),
+                    None,
                 )
                 .await
         }
@@ -1306,6 +1473,492 @@ async fn run_containers(client: &Client, cmd: ContainerCmd) -> Result<()> {
                 )
                 .await
         }
+        ContainerCmd::Snapshot { id, options } => {
+            run_lifecycle_mutation(
+                client,
+                Method::POST,
+                &format!("/api/containers/{}/snapshot", id),
+                options,
+            )
+            .await
+        }
+        ContainerCmd::Fork { id, options } => {
+            run_lifecycle_mutation(
+                client,
+                Method::POST,
+                &format!("/api/containers/{}/fork", id),
+                options,
+            )
+            .await
+        }
+        ContainerCmd::Resume { id, options } => {
+            run_lifecycle_mutation(
+                client,
+                Method::POST,
+                &format!("/api/containers/{}/resume", id),
+                options,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_snapshots(client: &Client, cmd: SnapshotCmd) -> Result<()> {
+    match cmd {
+        SnapshotCmd::List {
+            container_id,
+            label,
+        } => {
+            let mut query = Vec::new();
+            if let Some(v) = container_id {
+                query.push(format!("container_id={}", encode_query(&v)));
+            }
+            for l in label {
+                query.push(format!("label={}", encode_query(&l)));
+            }
+            let path = if query.is_empty() {
+                "/api/snapshots".to_string()
+            } else {
+                format!("/api/snapshots?{}", query.join("&"))
+            };
+            client
+                .send_json(Method::GET, &path, Default::default(), None)
+                .await
+        }
+        SnapshotCmd::Get { id } => {
+            client
+                .send_json(
+                    Method::GET,
+                    &format!("/api/snapshots/{}", id),
+                    Default::default(),
+                    None,
+                )
+                .await
+        }
+        SnapshotCmd::Lineage { id } => {
+            client
+                .send_json(
+                    Method::GET,
+                    &format!("/api/snapshots/{}/lineage", id),
+                    Default::default(),
+                    None,
+                )
+                .await
+        }
+        SnapshotCmd::Delete { id, options } => {
+            run_operation_mutation(
+                client,
+                Method::DELETE,
+                &format!("/api/snapshots/{}", id),
+                Some(serde_json::json!({})),
+                options,
+            )
+            .await
+        }
+        SnapshotCmd::Pin { id, options } => {
+            run_operation_mutation(
+                client,
+                Method::POST,
+                &format!("/api/snapshots/{}/pin", id),
+                Some(serde_json::json!({})),
+                options,
+            )
+            .await
+        }
+        SnapshotCmd::Unpin { id, options } => {
+            run_operation_mutation(
+                client,
+                Method::POST,
+                &format!("/api/snapshots/{}/unpin", id),
+                Some(serde_json::json!({})),
+                options,
+            )
+            .await
+        }
+        SnapshotCmd::Clone { id, options } => {
+            run_lifecycle_mutation(
+                client,
+                Method::POST,
+                &format!("/api/snapshots/{}/clone", id),
+                options,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_operations(client: &Client, cmd: OperationCmd) -> Result<()> {
+    match cmd {
+        OperationCmd::Get { operation_id } => {
+            let bytes = client
+                .send_json_bytes(
+                    Method::GET,
+                    &format!("/api/operations/{}", operation_id),
+                    Default::default(),
+                    None,
+                )
+                .await?;
+            let v: serde_json::Value = serde_json::from_slice(&bytes)
+                .context("Failed to parse operation response JSON")?;
+            let op: OperationResponse = serde_json::from_value(v).unwrap_or_default();
+            print_json_value(&operation_to_json(&op)?)?;
+            if let Some(status) = &op.status {
+                if status.is_terminal_failure() {
+                    anyhow::bail!(
+                        "operation {} terminated with status={}",
+                        operation_id,
+                        status.as_str()
+                    );
+                }
+            }
+            Ok(())
+        }
+        OperationCmd::Watch {
+            operation_id,
+            timeout_secs,
+        } => {
+            let op = wait_for_operation(client, &operation_id, Duration::from_secs(timeout_secs)).await?;
+            print_json_value(&operation_to_json(&op)?)?;
+            if let Some(status) = &op.status {
+                if status.is_terminal_failure() {
+                    anyhow::bail!("operation {} terminated with status={}", operation_id, status.as_str());
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn run_lifecycle_mutation(
+    client: &Client,
+    method: Method,
+    path: &str,
+    options: LifecycleRequestArgs,
+) -> Result<()> {
+    if matches!(options.network_mode, NetworkMode::PreserveConnBestEffort) && !options.dry_run {
+        anyhow::bail!(
+            "network_mode=preserve-conn-best-effort is risky; rerun with --dry-run first or choose a safer mode"
+        );
+    }
+
+    let labels = parse_labels(&options.label)?;
+    let placement_hint = options
+        .placement_hint_json
+        .as_deref()
+        .map(parse_json_arg)
+        .transpose()?;
+    let idempotency_key = options
+        .mutation
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let body = serde_json::json!({
+        "consistency_mode": consistency_mode_str(options.consistency_mode),
+        "network_mode": network_mode_str(options.network_mode),
+        "volume_mode": volume_mode_str(options.volume_mode),
+        "resume_policy": resume_policy_str(options.resume_policy),
+        "placement_hint": placement_hint,
+        "ttl_seconds": options.ttl_seconds,
+        "labels": labels,
+        "idempotency_key": idempotency_key,
+        "dry_run": options.dry_run,
+    });
+
+    run_operation_mutation(client, method, path, Some(body), options.mutation).await
+}
+
+async fn run_operation_mutation(
+    client: &Client,
+    method: Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+    options: MutationControlArgs,
+) -> Result<()> {
+    preflight_capabilities(client, options.cluster_id.as_deref(), &options.require_capability).await?;
+
+    let idempotency_key = options
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::HeaderName::from_static("idempotency-key"),
+        reqwest::header::HeaderValue::from_str(&idempotency_key)?,
+    );
+
+    let bytes = client.send_json_bytes(method, path, headers, body).await?;
+    let response_value: serde_json::Value = if bytes.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_slice(&bytes).context("Failed to parse operation response JSON")?
+    };
+
+    let mut response: OperationResponse =
+        serde_json::from_value(response_value.clone()).unwrap_or_default();
+    if response.operation_id.is_none() {
+        response.operation_id = response_value
+            .get("operation_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+    }
+
+    let op_id = response
+        .operation_id
+        .clone()
+        .context("mutating call did not return operation_id")?;
+    print_json_value(&serde_json::json!({
+        "operation_id": op_id,
+        "status": "accepted",
+    }))?;
+
+    if options.wait {
+        let op = wait_for_operation(client, &op_id, Duration::from_secs(options.timeout_secs)).await?;
+        let json = operation_to_json(&op)?;
+        print_json_value(&json)?;
+        if let Some(status) = &op.status {
+            if status.is_terminal_failure() {
+                let hint = reason_code_hint(op.reason_code.as_deref());
+                if let Some(h) = hint {
+                    anyhow::bail!(
+                        "operation {} failed: status={} reason_code={:?} hint={}",
+                        op_id,
+                        status.as_str(),
+                        op.reason_code,
+                        h
+                    );
+                }
+                anyhow::bail!(
+                    "operation {} failed: status={} reason_code={:?}",
+                    op_id,
+                    status.as_str(),
+                    op.reason_code
+                );
+            }
+        }
+    } else {
+        print_json_value(&response_value)?;
+    }
+
+    Ok(())
+}
+
+async fn wait_for_operation(
+    client: &Client,
+    operation_id: &str,
+    timeout: Duration,
+) -> Result<OperationResponse> {
+    let started = std::time::Instant::now();
+    loop {
+        if started.elapsed() > timeout {
+            anyhow::bail!("operation {} timed out after {:?}", operation_id, timeout);
+        }
+        let bytes = client
+            .send_json_bytes(
+                Method::GET,
+                &format!("/api/operations/{}", operation_id),
+                Default::default(),
+                None,
+            )
+            .await?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).context("Failed to parse operation JSON")?;
+        let op: OperationResponse = serde_json::from_value(v).unwrap_or_default();
+        if let Some(status) = &op.status {
+            if status.is_terminal() {
+                return Ok(op);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+}
+
+async fn preflight_capabilities(
+    client: &Client,
+    cluster_id: Option<&str>,
+    required: &[String],
+) -> Result<()> {
+    if required.is_empty() {
+        return Ok(());
+    }
+    let cluster_id =
+        cluster_id.context("--require-capability needs --cluster-id to run preflight checks")?;
+
+    let bytes = match client
+        .send_json_bytes(
+            Method::GET,
+            &format!("/api/clusters/{}/capabilities", cluster_id),
+            Default::default(),
+            None,
+        )
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            client
+                .send_json_bytes(
+                    Method::GET,
+                    &format!("/api/capabilities?cluster_id={}", encode_query(cluster_id)),
+                    Default::default(),
+                    None,
+                )
+                .await?
+        }
+    };
+    let raw: serde_json::Value =
+        serde_json::from_slice(&bytes).context("Failed to parse capabilities JSON")?;
+    let matrix = parse_capability_matrix(raw);
+
+    let mut missing = Vec::new();
+    for cap in required {
+        if !matrix.get(cap).copied().unwrap_or(false) {
+            missing.push(cap.clone());
+        }
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "UNSUPPORTED_NODE_CAPABILITY: cluster_id={} missing_capabilities={}",
+            cluster_id,
+            missing.join(",")
+        );
+    }
+    Ok(())
+}
+
+fn parse_capability_matrix(v: serde_json::Value) -> std::collections::BTreeMap<String, bool> {
+    let mut out = std::collections::BTreeMap::new();
+    let matrix: Option<CapabilityMatrix> = serde_json::from_value(v.clone()).ok();
+    if let Some(m) = matrix {
+        if let Some(c) = m.capabilities {
+            return c;
+        }
+    }
+    if let Some(obj) = v.get("capabilities").and_then(|x| x.as_object()) {
+        for (k, v) in obj {
+            out.insert(k.clone(), v.as_bool().unwrap_or(false));
+        }
+        return out;
+    }
+    if let Some(obj) = v.as_object() {
+        for (k, v) in obj {
+            if let Some(b) = v.as_bool() {
+                out.insert(k.clone(), b);
+            }
+        }
+    }
+    out
+}
+
+fn build_events_path(
+    operation_id: Option<String>,
+    snapshot_id: Option<String>,
+    container_id: Option<String>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(v) = operation_id {
+        parts.push(format!("operation_id={}", encode_query(&v)));
+    }
+    if let Some(v) = snapshot_id {
+        parts.push(format!("snapshot_id={}", encode_query(&v)));
+    }
+    if let Some(v) = container_id {
+        parts.push(format!("container_id={}", encode_query(&v)));
+    }
+    if parts.is_empty() {
+        "/api/events".to_string()
+    } else {
+        format!("/api/events?{}", parts.join("&"))
+    }
+}
+
+fn parse_labels(labels: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for entry in labels {
+        let (k, v) = entry
+            .split_once('=')
+            .with_context(|| format!("invalid --label '{}', expected key=value", entry))?;
+        if k.trim().is_empty() {
+            anyhow::bail!("invalid --label '{}': key cannot be empty", entry);
+        }
+        out.insert(k.trim().to_string(), v.trim().to_string());
+    }
+    Ok(out)
+}
+
+fn operation_to_json(op: &OperationResponse) -> Result<serde_json::Value> {
+    let mut v = serde_json::to_value(op)?;
+    if let Some(reason_code) = &op.reason_code {
+        if let Some(hint) = reason_code_hint(Some(reason_code)) {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "action_hint".to_string(),
+                    serde_json::Value::String(hint.to_string()),
+                );
+            }
+        }
+    }
+    Ok(v)
+}
+
+fn reason_code_hint(reason_code: Option<&str>) -> Option<&'static str> {
+    match reason_code {
+        Some("UNSUPPORTED_NODE_CAPABILITY") => {
+            Some("Check cluster capabilities and rerun with a compatible mode or node selector.")
+        }
+        Some("KERNEL_INCOMPATIBLE") => Some("Target a node pool with compatible kernel features."),
+        Some("CGROUP_MODE_MISMATCH") => Some("Align cgroup mode between source and target nodes."),
+        Some("SECCOMP_PROFILE_INCOMPATIBLE") => {
+            Some("Use a compatible seccomp profile or relax policy for this workflow.")
+        }
+        Some("APPARMOR_PROFILE_INCOMPATIBLE") => {
+            Some("Use a compatible apparmor profile or choose a different target.")
+        }
+        Some("ARCH_MISMATCH") => Some("Target nodes with matching CPU architecture."),
+        Some("SNAPSHOT_NOT_FOUND") => Some("Verify snapshot ID and tenant scope."),
+        Some("SNAPSHOT_PINNED") => Some("Unpin snapshot before deleting."),
+        Some("SNAPSHOT_IN_USE") => Some("Stop dependent containers/workloads, then retry."),
+        Some("POLICY_DENIED") => Some("Check org policy or runtime policy bindings."),
+        Some("TENANT_ISOLATION_VIOLATION") => Some("Use resources within the same tenant boundary."),
+        Some("ARTIFACT_INTEGRITY_FAILURE") => Some("Recreate snapshot and validate artifact storage."),
+        Some("STORAGE_QUOTA_EXCEEDED") => Some("Increase quota or delete unused snapshots."),
+        Some("IDEMPOTENCY_CONFLICT") => Some("Reuse the original idempotency key intent or rotate key."),
+        Some("TIMEOUT") => Some("Retry with longer timeout and inspect operation/event logs."),
+        _ => None,
+    }
+}
+
+fn print_json_value(v: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
+}
+
+fn consistency_mode_str(v: ConsistencyMode) -> &'static str {
+    match v {
+        ConsistencyMode::CrashConsistent => "crash-consistent",
+        ConsistencyMode::AppConsistent => "app-consistent",
+    }
+}
+
+fn network_mode_str(v: NetworkMode) -> &'static str {
+    match v {
+        NetworkMode::Reset => "reset",
+        NetworkMode::PreserveNs => "preserve_ns",
+        NetworkMode::PreserveConnBestEffort => "preserve_conn_best_effort",
+    }
+}
+
+fn volume_mode_str(v: VolumeMode) -> &'static str {
+    match v {
+        VolumeMode::Exclude => "exclude",
+        VolumeMode::IncludeNamed => "include_named",
+        VolumeMode::IncludeAllAllowed => "include_all_allowed",
+    }
+}
+
+fn resume_policy_str(v: ResumePolicy) -> &'static str {
+    match v {
+        ResumePolicy::Manual => "manual",
+        ResumePolicy::Immediate => "immediate",
     }
 }
 
@@ -1362,6 +2015,10 @@ fn encode_path(path: &str) -> String {
         .map(|seg| percent_encode(seg.as_bytes(), NON_ALPHANUMERIC).to_string())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn encode_query(value: &str) -> String {
+    percent_encode(value.as_bytes(), NON_ALPHANUMERIC).to_string()
 }
 
 fn load_node_token(

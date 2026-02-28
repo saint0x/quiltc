@@ -96,10 +96,38 @@ Logs:
 quiltc containers logs <container_id>
 ```
 
+Snapshot/fork/resume lifecycle:
+
+```bash
+quiltc containers snapshot <container_id> --wait
+quiltc containers fork <container_id> --wait
+quiltc containers resume <container_or_snapshot_id> --wait
+```
+
+Snapshot management:
+
+```bash
+quiltc snapshots list --container-id <container_id>
+quiltc snapshots get <snapshot_id>
+quiltc snapshots lineage <snapshot_id>
+quiltc snapshots clone <snapshot_id> --wait
+quiltc snapshots pin <snapshot_id>
+quiltc snapshots unpin <snapshot_id>
+quiltc snapshots delete <snapshot_id>
+```
+
+Operation status:
+
+```bash
+quiltc operations get <operation_id>
+quiltc operations watch <operation_id> --timeout-secs 300
+```
+
 Events (SSE):
 
 ```bash
 quiltc events
+quiltc events --operation-id <operation_id>
 ```
 
 ## Volumes (File Push/Pull)

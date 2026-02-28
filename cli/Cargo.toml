@@ -18,3 +18,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 base64 = "0.22"
 percent-encoding = "2.3"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+httpmock = "0.7"

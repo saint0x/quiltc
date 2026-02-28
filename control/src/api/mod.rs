@@ -32,6 +32,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             // Containers
             .route("/api/containers", any(quilt_proxy))
             .route("/api/containers/*path", any(quilt_proxy))
+            // Snapshots
+            .route("/api/snapshots", any(quilt_proxy))
+            .route("/api/snapshots/*path", any(quilt_proxy))
+            // Operations
+            .route("/api/operations", any(quilt_proxy))
+            .route("/api/operations/*path", any(quilt_proxy))
             // Auth
             .route("/api/auth/*path", any(quilt_proxy))
             // Volumes
