@@ -1,12 +1,50 @@
 # Kubernetes Parity: What `quiltc` Verifies (And What It Does Not)
 
-Date: 2026-02-17
+Date: 2026-03-01
 
 This document describes the **verified Kubernetes-like functionality** of `quiltc` when used against the Quilt backend (`https://backend.quilt.sh`), and the **exact scope** where Quilt’s cluster primitives provide parity with common Kubernetes workflows.
 
 This is intentionally precise: it describes what was exercised live and what semantics are (and are not) present.
 
 Related: `RESULTS.md` contains the concrete live verification evidence pointers.
+
+Positioning note:
+- `quiltc` remains Kubernetes-like by design, and now includes bi-directional Kubernetes backend compatibility workflows via `/api/k8s/*`.
+
+## K8s Manifest Workflows (Backend + `quiltc` Complete)
+
+As of 2026-03-01, Quilt backend and `quiltc` together provide a complete backend-driven Kubernetes manifest command surface:
+
+- `quiltc k8s validate -f <file|dir|url>`
+- `quiltc k8s apply -f <file|dir|url> --cluster-id <id>`
+- `quiltc k8s diff -f <file|dir|url> --cluster-id <id>`
+- `quiltc k8s status --operation <id> --cluster-id <id>`
+- `quiltc k8s get resources [filters]`
+- `quiltc k8s get resource <resource_id> --cluster-id <id>`
+- `quiltc k8s delete <resource_id> --cluster-id <id>`
+- `quiltc k8s export --cluster-id <id> -o yaml|json`
+- `quiltc k8s capabilities`
+- `quiltc k8s schema`
+
+Behavior implemented in CLI (against completed backend workflows):
+
+- Local manifest collection only (`file|dir|url`) with deterministic ordering for multi-doc sends.
+- Raw payload handoff to backend `/api/k8s/*` endpoints.
+- Manifest input field is `manifest` (single YAML string; multi-doc via `---`).
+- Apply status endpoint is `/api/k8s/applies/:operation_id?cluster_id=<required>`.
+- No client-side Kubernetes translation logic.
+- `apply` validates first by default (`--no-validate` to skip).
+- `--dry-run` uses validate/diff flow.
+- `--strict` treats warnings as failures.
+- Stable CI exit codes:
+  - `0` success
+  - `2` validation failure
+  - `3` apply/delete/operation failure
+  - `4` transport/auth failure
+
+Delivery note:
+- The command surface above is complete and aligned to backend-driven `/api/k8s/*` workflows.
+- Operator UX, error surfacing, and CI semantics are implemented for production usage.
 
 ## Mental Model Mapping (Kubernetes -> Quilt)
 

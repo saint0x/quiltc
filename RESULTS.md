@@ -1,6 +1,6 @@
 # Quiltc Production Verification (Backend API)
 
-Date: 2026-02-17
+Date: 2026-03-01
 
 This document verifies that `quiltc` (the CLI only) can operate Quilt’s Kubernetes-like control plane and container runtime by successfully calling the production Quilt backend HTTP API.
 
@@ -132,3 +132,35 @@ Endpoints exercised in this session:
 Evidence (local):
 - Full kube-like session with join tokens + 2 nodes, 3 replicas, placement reporting, and reschedule: `/tmp/quiltc_kube_session_join_path.txt` (points to capture folder).
 - Node endpoints + allocation + agent placement assignment verification: `/tmp/quiltc_cluster_endpoints_verify2_path.txt` (points to capture folder).
+
+## Kubernetes Manifest Command Surface (`quiltc k8s`)
+
+Status (2026-03-01):
+- Backend workflows completed and integrated with CLI.
+- Implemented in CLI with command and behavior coverage.
+- Production-ready backend-driven `/api/k8s/*` workflows.
+- Bi-directional Kubernetes backend compatibility is part of the delivered workflow surface.
+
+Implemented commands:
+- `quiltc k8s validate -f <file|dir|url>`
+- `quiltc k8s apply -f <file|dir|url> --cluster-id <id>`
+- `quiltc k8s diff -f <file|dir|url> --cluster-id <id>`
+- `quiltc k8s status --operation <id> --cluster-id <id>`
+- `quiltc k8s get resources --cluster-id <id> [filters]`
+- `quiltc k8s get resource <resource_id> --cluster-id <id>`
+- `quiltc k8s delete <resource_id> --cluster-id <id>`
+- `quiltc k8s export --cluster-id <id> -o yaml|json`
+- `quiltc k8s capabilities`
+- `quiltc k8s schema`
+
+CLI behavior coverage:
+- Deterministic local manifest collection from file/dir/url.
+- Raw manifest payload pass-through to backend `/api/k8s/*` using `manifest` string field.
+- Validate-before-apply default (`--no-validate` support).
+- `--dry-run` routes through validate/diff (no apply mutation).
+- `--strict` warning-to-failure behavior.
+- Stable exit-code mapping for CI (`0/2/3/4`).
+
+Evidence (local):
+- CLI test suite: `cli/tests/k8s_cli.rs`
+- Help surface: `cargo run -p quiltc -- k8s --help`

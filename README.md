@@ -159,6 +159,39 @@ quiltc request GET /api/clusters
 quiltc request POST /api/clusters/<cluster_id>/join-tokens --json '{\"ttl_secs\":600,\"max_uses\":1}'
 ```
 
+## Kubernetes Manifests (Backend-Driven)
+
+`quiltc` keeps the Kubernetes-like operator UX while supporting bi-directional Kubernetes backend compatibility. The CLI does local manifest collection only (file/dir/url), then sends raw payloads to backend `/api/k8s/*` endpoints. The CLI does not perform Kubernetes translation logic.
+
+```bash
+quiltc k8s validate -f ./manifests --namespace default
+quiltc k8s apply -f ./manifests --cluster-id <cluster_id> --application default --follow
+quiltc k8s apply -f ./manifests --cluster-id <cluster_id> --dry-run
+quiltc k8s diff -f ./manifests --cluster-id <cluster_id>
+quiltc k8s status --operation <operation_id> --cluster-id <cluster_id> --follow
+quiltc k8s get resources --cluster-id <cluster_id> --kind Deployment
+quiltc k8s get resource <resource_id> --cluster-id <cluster_id>
+quiltc k8s delete <resource_id> --cluster-id <cluster_id>
+quiltc k8s export --cluster-id <cluster_id> -o yaml
+quiltc k8s capabilities
+quiltc k8s schema
+```
+
+Behavior:
+- Request contract uses single `manifest` YAML string (multi-doc supported with `---`).
+- `apply` and `diff` require `--cluster-id`; `status` and resource paths are cluster-scoped.
+- `apply` validates first by default (use `--no-validate` to skip).
+- `--dry-run` uses validate+diff flow without apply.
+- `--strict` treats backend warnings as failures.
+- `--json` prints backend JSON as-is for machine use.
+- Manifest order is deterministic across directory inputs (`.yaml`, `.yml`, `.json`, lexical order).
+
+K8s CI exit codes:
+- `0`: success
+- `2`: validation failure
+- `3`: apply/delete/operation failure
+- `4`: transport or auth failure
+
 ## Docs
 
 - `RESULTS.md` for live verification evidence and the exact endpoint coverage.

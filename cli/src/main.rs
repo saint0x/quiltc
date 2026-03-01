@@ -8,7 +8,9 @@ use base64::Engine;
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use reqwest::Method;
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::Level;
@@ -17,7 +19,12 @@ use uuid::Uuid;
 
 use crate::config::{default_config_path, node_token_key, Config};
 use crate::http_client::{header_kv, Client, TenantAuth};
-use crate::snapshot_types::{CapabilityMatrix, OperationResponse};
+use crate::snapshot_types::{CapabilityMatrix, OperationResponse, OperationStatus};
+
+const EXIT_VALIDATION_FAILURE: i32 = 2;
+const EXIT_APPLY_FAILURE: i32 = 3;
+const EXIT_TRANSPORT_OR_AUTH_FAILURE: i32 = 4;
+const EXIT_GENERIC_FAILURE: i32 = 1;
 
 #[derive(Parser, Debug)]
 #[command(name = "quiltc")]
@@ -139,6 +146,12 @@ enum Command {
         /// Write response body to file (GET only)
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+
+    /// Kubernetes manifest workflows (backend-driven; no client-side translation)
+    K8s {
+        #[command(subcommand)]
+        cmd: K8sCmd,
     },
 }
 
@@ -499,6 +512,148 @@ enum OperationCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum K8sCmd {
+    Validate {
+        #[arg(short = 'f', long = "file", required = true)]
+        sources: Vec<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long, default_value_t = false)]
+        strict: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = false)]
+        non_interactive: bool,
+    },
+    Apply {
+        #[arg(short = 'f', long = "file", required = true)]
+        sources: Vec<String>,
+        #[arg(long)]
+        cluster_id: String,
+        #[arg(long, default_value = "default")]
+        application: String,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long, default_value_t = false)]
+        no_validate: bool,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        prune: bool,
+        #[arg(long, default_value_t = false)]
+        strict: bool,
+        #[arg(long, default_value_t = false)]
+        follow: bool,
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = false)]
+        non_interactive: bool,
+    },
+    Diff {
+        #[arg(short = 'f', long = "file", required = true)]
+        sources: Vec<String>,
+        #[arg(long)]
+        cluster_id: String,
+        #[arg(long, default_value = "default")]
+        application: String,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long, default_value_t = false)]
+        strict: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = false)]
+        non_interactive: bool,
+    },
+    Status {
+        #[arg(long = "operation")]
+        operation_id: String,
+        #[arg(long)]
+        cluster_id: String,
+        #[arg(long, default_value_t = false)]
+        follow: bool,
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = false)]
+        non_interactive: bool,
+    },
+    Get {
+        #[command(subcommand)]
+        cmd: K8sGetCmd,
+    },
+    Delete {
+        resource_id: String,
+        #[arg(long)]
+        cluster_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = false)]
+        non_interactive: bool,
+    },
+    Export {
+        #[arg(long)]
+        cluster_id: String,
+        #[arg(long, default_value = "default")]
+        application: String,
+        #[arg(short = 'o', long = "output", default_value = "yaml")]
+        output: K8sExportFormat,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = false)]
+        non_interactive: bool,
+    },
+    Capabilities {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = false)]
+        non_interactive: bool,
+    },
+    Schema {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = false)]
+        non_interactive: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum K8sGetCmd {
+    Resources {
+        #[arg(long)]
+        cluster_id: String,
+        #[arg(long)]
+        application: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        include_secrets: Option<bool>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = false)]
+        non_interactive: bool,
+    },
+    Resource {
+        resource_id: String,
+        #[arg(long)]
+        cluster_id: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = false)]
+        non_interactive: bool,
+    },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum K8sExportFormat {
+    Yaml,
+    Json,
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum ConsistencyMode {
     CrashConsistent,
@@ -644,6 +799,13 @@ async fn main() -> Result<()> {
             stream,
             out,
         } => run_request(&tenant_client, method, path, json, header, stream, out).await,
+        Command::K8s { cmd } => match run_k8s(&tenant_client, cmd).await {
+            Ok(()) => Ok(()),
+            Err(f) => {
+                eprintln!("{}", f.message);
+                std::process::exit(f.exit_code);
+            }
+        },
     }
 }
 
@@ -1600,8 +1762,8 @@ async fn run_operations(client: &Client, cmd: OperationCmd) -> Result<()> {
                 .await?;
             let v: serde_json::Value = serde_json::from_slice(&bytes)
                 .context("Failed to parse operation response JSON")?;
-            let op: OperationResponse = serde_json::from_value(v).unwrap_or_default();
-            print_json_value(&operation_to_json(&op)?)?;
+            let op = parse_operation_response(&v);
+            print_json_value(&operation_to_json(&op, Some(&v))?)?;
             if let Some(status) = &op.status {
                 if status.is_terminal_failure() {
                     anyhow::bail!(
@@ -1617,11 +1779,16 @@ async fn run_operations(client: &Client, cmd: OperationCmd) -> Result<()> {
             operation_id,
             timeout_secs,
         } => {
-            let op = wait_for_operation(client, &operation_id, Duration::from_secs(timeout_secs)).await?;
-            print_json_value(&operation_to_json(&op)?)?;
+            let op = wait_for_operation(client, &operation_id, Duration::from_secs(timeout_secs))
+                .await?;
+            print_json_value(&operation_to_json(&op, None)?)?;
             if let Some(status) = &op.status {
                 if status.is_terminal_failure() {
-                    anyhow::bail!("operation {} terminated with status={}", operation_id, status.as_str());
+                    anyhow::bail!(
+                        "operation {} terminated with status={}",
+                        operation_id,
+                        status.as_str()
+                    );
                 }
             }
             Ok(())
@@ -1675,7 +1842,12 @@ async fn run_operation_mutation(
     body: Option<serde_json::Value>,
     options: MutationControlArgs,
 ) -> Result<()> {
-    preflight_capabilities(client, options.cluster_id.as_deref(), &options.require_capability).await?;
+    preflight_capabilities(
+        client,
+        options.cluster_id.as_deref(),
+        &options.require_capability,
+    )
+    .await?;
 
     let idempotency_key = options
         .idempotency_key
@@ -1694,8 +1866,7 @@ async fn run_operation_mutation(
         serde_json::from_slice(&bytes).context("Failed to parse operation response JSON")?
     };
 
-    let mut response: OperationResponse =
-        serde_json::from_value(response_value.clone()).unwrap_or_default();
+    let mut response: OperationResponse = parse_operation_response(&response_value);
     if response.operation_id.is_none() {
         response.operation_id = response_value
             .get("operation_id")
@@ -1703,41 +1874,54 @@ async fn run_operation_mutation(
             .map(str::to_string);
     }
 
-    let op_id = response
-        .operation_id
-        .clone()
-        .context("mutating call did not return operation_id")?;
-    print_json_value(&serde_json::json!({
-        "operation_id": op_id,
-        "status": "accepted",
-    }))?;
+    if let Some(op_id) = response.operation_id.clone() {
+        print_json_value(&serde_json::json!({
+            "operation_id": op_id,
+            "status": response
+                .status
+                .as_ref()
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_else(|| "accepted".to_string()),
+        }))?;
 
-    if options.wait {
-        let op = wait_for_operation(client, &op_id, Duration::from_secs(options.timeout_secs)).await?;
-        let json = operation_to_json(&op)?;
-        print_json_value(&json)?;
-        if let Some(status) = &op.status {
-            if status.is_terminal_failure() {
-                let hint = reason_code_hint(op.reason_code.as_deref());
-                if let Some(h) = hint {
+        if options.wait {
+            let op = wait_for_operation(client, &op_id, Duration::from_secs(options.timeout_secs))
+                .await?;
+            let json = operation_to_json(&op, None)?;
+            print_json_value(&json)?;
+            if let Some(status) = &op.status {
+                if status.is_terminal_failure() {
+                    let hint = reason_code_hint(op.reason_code.as_deref());
+                    if let Some(h) = hint {
+                        anyhow::bail!(
+                            "operation {} failed: status={} reason_code={:?} hint={}",
+                            op_id,
+                            status.as_str(),
+                            op.reason_code,
+                            h
+                        );
+                    }
                     anyhow::bail!(
-                        "operation {} failed: status={} reason_code={:?} hint={}",
+                        "operation {} failed: status={} reason_code={:?}",
                         op_id,
                         status.as_str(),
-                        op.reason_code,
-                        h
+                        op.reason_code
                     );
                 }
-                anyhow::bail!(
-                    "operation {} failed: status={} reason_code={:?}",
-                    op_id,
-                    status.as_str(),
-                    op.reason_code
-                );
             }
+        } else {
+            print_json_value(&response_value)?;
         }
     } else {
+        // Some mutation endpoints are synchronous and return terminal payloads
+        // without operation ids. Treat these as valid success responses.
         print_json_value(&response_value)?;
+        if options.wait {
+            print_json_value(&serde_json::json!({
+                "status": "succeeded",
+                "note": "endpoint returned synchronous response without operation_id"
+            }))?;
+        }
     }
 
     Ok(())
@@ -1763,7 +1947,7 @@ async fn wait_for_operation(
             .await?;
         let v: serde_json::Value =
             serde_json::from_slice(&bytes).context("Failed to parse operation JSON")?;
-        let op: OperationResponse = serde_json::from_value(v).unwrap_or_default();
+        let op = parse_operation_response(&v);
         if let Some(status) = &op.status {
             if status.is_terminal() {
                 return Ok(op);
@@ -1885,8 +2069,15 @@ fn parse_labels(labels: &[String]) -> Result<std::collections::BTreeMap<String, 
     Ok(out)
 }
 
-fn operation_to_json(op: &OperationResponse) -> Result<serde_json::Value> {
-    let mut v = serde_json::to_value(op)?;
+fn operation_to_json(
+    op: &OperationResponse,
+    raw: Option<&serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let mut v = if let Some(raw) = raw {
+        raw.clone()
+    } else {
+        serde_json::to_value(op)?
+    };
     if let Some(reason_code) = &op.reason_code {
         if let Some(hint) = reason_code_hint(Some(reason_code)) {
             if let Some(obj) = v.as_object_mut() {
@@ -1898,6 +2089,67 @@ fn operation_to_json(op: &OperationResponse) -> Result<serde_json::Value> {
         }
     }
     Ok(v)
+}
+
+fn parse_operation_response(v: &serde_json::Value) -> OperationResponse {
+    let status = v.get("status").and_then(|s| s.as_str()).map(|s| match s {
+        "accepted" => OperationStatus::Accepted,
+        "running" => OperationStatus::Running,
+        "succeeded" => OperationStatus::Succeeded,
+        "failed" => OperationStatus::Failed,
+        "cancelled" => OperationStatus::Cancelled,
+        other => OperationStatus::Unknown(other.to_string()),
+    });
+
+    OperationResponse {
+        operation_id: v
+            .get("operation_id")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        status,
+        operation_type: v
+            .get("operation_type")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        snapshot_id: v
+            .get("snapshot_id")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        container_id: v
+            .get("container_id")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        result_container_id: v
+            .get("result_container_id")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        warnings: v.get("warnings").and_then(|x| {
+            x.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+        }),
+        capability_downgrades: v.get("capability_downgrades").and_then(|x| {
+            x.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+        }),
+        reason_code: v
+            .get("reason_code")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        reason_message: v
+            .get("reason_message")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        progress_pct: v.get("progress_pct").cloned(),
+        started_at: v.get("started_at").cloned(),
+        updated_at: v.get("updated_at").cloned(),
+        completed_at: v.get("completed_at").cloned(),
+    }
 }
 
 fn reason_code_hint(reason_code: Option<&str>) -> Option<&'static str> {
@@ -1918,10 +2170,16 @@ fn reason_code_hint(reason_code: Option<&str>) -> Option<&'static str> {
         Some("SNAPSHOT_PINNED") => Some("Unpin snapshot before deleting."),
         Some("SNAPSHOT_IN_USE") => Some("Stop dependent containers/workloads, then retry."),
         Some("POLICY_DENIED") => Some("Check org policy or runtime policy bindings."),
-        Some("TENANT_ISOLATION_VIOLATION") => Some("Use resources within the same tenant boundary."),
-        Some("ARTIFACT_INTEGRITY_FAILURE") => Some("Recreate snapshot and validate artifact storage."),
+        Some("TENANT_ISOLATION_VIOLATION") => {
+            Some("Use resources within the same tenant boundary.")
+        }
+        Some("ARTIFACT_INTEGRITY_FAILURE") => {
+            Some("Recreate snapshot and validate artifact storage.")
+        }
         Some("STORAGE_QUOTA_EXCEEDED") => Some("Increase quota or delete unused snapshots."),
-        Some("IDEMPOTENCY_CONFLICT") => Some("Reuse the original idempotency key intent or rotate key."),
+        Some("IDEMPOTENCY_CONFLICT") => {
+            Some("Reuse the original idempotency key intent or rotate key.")
+        }
         Some("TIMEOUT") => Some("Retry with longer timeout and inspect operation/event logs."),
         _ => None,
     }
@@ -1960,6 +2218,682 @@ fn resume_policy_str(v: ResumePolicy) -> &'static str {
         ResumePolicy::Manual => "manual",
         ResumePolicy::Immediate => "immediate",
     }
+}
+
+#[derive(Debug)]
+struct K8sFailure {
+    exit_code: i32,
+    message: String,
+}
+
+impl K8sFailure {
+    fn new(exit_code: i32, message: impl Into<String>) -> Self {
+        Self {
+            exit_code,
+            message: message.into(),
+        }
+    }
+}
+
+async fn run_k8s(client: &Client, cmd: K8sCmd) -> std::result::Result<(), K8sFailure> {
+    match cmd {
+        K8sCmd::Validate {
+            sources,
+            namespace,
+            strict,
+            json,
+            non_interactive,
+        } => {
+            let _ = non_interactive;
+            let manifests = collect_manifest_sources(&sources)
+                .await
+                .map_err(|e| K8sFailure::new(EXIT_GENERIC_FAILURE, e.to_string()))?;
+            let body = serde_json::json!({
+                "manifest": k8s_manifest_string(&manifests),
+                "namespace": namespace,
+                "strict": strict
+            });
+            let response = k8s_call(client, Method::POST, "/api/k8s/validate", Some(body), None)
+                .await
+                .map_err(|e| map_k8s_transport_or_auth(e, EXIT_VALIDATION_FAILURE))?;
+            k8s_emit_response(&response, json, true)?;
+            if strict && k8s_has_warnings(&response) {
+                return Err(K8sFailure::new(
+                    EXIT_VALIDATION_FAILURE,
+                    "validation produced warnings and --strict is enabled",
+                ));
+            }
+            Ok(())
+        }
+        K8sCmd::Apply {
+            sources,
+            cluster_id,
+            application,
+            namespace,
+            no_validate,
+            dry_run,
+            prune,
+            strict,
+            follow,
+            timeout_secs,
+            json,
+            non_interactive,
+        } => {
+            let _ = non_interactive;
+            let manifests = collect_manifest_sources(&sources)
+                .await
+                .map_err(|e| K8sFailure::new(EXIT_GENERIC_FAILURE, e.to_string()))?;
+            let manifest = k8s_manifest_string(&manifests);
+
+            if !no_validate {
+                let validate_body = serde_json::json!({
+                    "manifest": manifest,
+                    "namespace": namespace,
+                    "strict": strict
+                });
+                let validate_resp = k8s_call(
+                    client,
+                    Method::POST,
+                    "/api/k8s/validate",
+                    Some(validate_body),
+                    None,
+                )
+                .await
+                .map_err(|e| map_k8s_transport_or_auth(e, EXIT_VALIDATION_FAILURE))?;
+                k8s_emit_response(&validate_resp, json, true)?;
+                if strict && k8s_has_warnings(&validate_resp) {
+                    return Err(K8sFailure::new(
+                        EXIT_VALIDATION_FAILURE,
+                        "validation produced warnings and --strict is enabled",
+                    ));
+                }
+            }
+
+            if dry_run {
+                let diff_body = serde_json::json!({
+                    "manifest": manifest,
+                    "cluster_id": cluster_id,
+                    "application": application,
+                    "namespace": namespace,
+                    "strict": strict
+                });
+                let diff_resp =
+                    k8s_call(client, Method::POST, "/api/k8s/diff", Some(diff_body), None)
+                        .await
+                        .map_err(|e| map_k8s_transport_or_auth(e, EXIT_VALIDATION_FAILURE))?;
+                k8s_emit_response(&diff_resp, json, true)?;
+                if strict && k8s_has_warnings(&diff_resp) {
+                    return Err(K8sFailure::new(
+                        EXIT_VALIDATION_FAILURE,
+                        "diff produced warnings and --strict is enabled",
+                    ));
+                }
+                return Ok(());
+            }
+
+            let apply_body = serde_json::json!({
+                "manifest": manifest,
+                "cluster_id": cluster_id,
+                "application": application,
+                "namespace": namespace,
+                "strict": strict,
+                "dry_run": false,
+                "prune": prune
+            });
+            let apply_resp = k8s_call(
+                client,
+                Method::POST,
+                "/api/k8s/apply",
+                Some(apply_body),
+                None,
+            )
+            .await
+            .map_err(|e| map_k8s_transport_or_auth(e, EXIT_APPLY_FAILURE))?;
+            k8s_emit_response(&apply_resp, json, true)?;
+
+            if strict && k8s_has_warnings(&apply_resp) {
+                return Err(K8sFailure::new(
+                    EXIT_APPLY_FAILURE,
+                    "apply produced warnings and --strict is enabled",
+                ));
+            }
+
+            if let Some(op_id) = extract_operation_id(&apply_resp) {
+                println!("operation_id: {}", op_id);
+                if follow {
+                    let op = k8s_wait_for_apply_operation(
+                        client,
+                        &op_id,
+                        &cluster_id,
+                        Duration::from_secs(timeout_secs),
+                    )
+                    .await?;
+                    k8s_emit_response(&op, json, false)?;
+                    if k8s_operation_failed(&op) {
+                        return Err(K8sFailure::new(
+                            EXIT_APPLY_FAILURE,
+                            format!("operation {} terminated with failure", op_id),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        K8sCmd::Diff {
+            sources,
+            cluster_id,
+            application,
+            namespace,
+            strict,
+            json,
+            non_interactive,
+        } => {
+            let _ = non_interactive;
+            let manifests = collect_manifest_sources(&sources)
+                .await
+                .map_err(|e| K8sFailure::new(EXIT_GENERIC_FAILURE, e.to_string()))?;
+            let body = serde_json::json!({
+                "manifest": k8s_manifest_string(&manifests),
+                "cluster_id": cluster_id,
+                "application": application,
+                "namespace": namespace,
+                "strict": strict
+            });
+            let response = k8s_call(client, Method::POST, "/api/k8s/diff", Some(body), None)
+                .await
+                .map_err(|e| map_k8s_transport_or_auth(e, EXIT_VALIDATION_FAILURE))?;
+            k8s_emit_response(&response, json, true)?;
+            if strict && k8s_has_warnings(&response) {
+                return Err(K8sFailure::new(
+                    EXIT_VALIDATION_FAILURE,
+                    "diff produced warnings and --strict is enabled",
+                ));
+            }
+            Ok(())
+        }
+        K8sCmd::Status {
+            operation_id,
+            cluster_id,
+            follow,
+            timeout_secs,
+            json,
+            non_interactive,
+        } => {
+            let _ = non_interactive;
+            if follow {
+                let op = k8s_wait_for_apply_operation(
+                    client,
+                    &operation_id,
+                    &cluster_id,
+                    Duration::from_secs(timeout_secs),
+                )
+                .await?;
+                k8s_emit_response(&op, json, false)?;
+                if k8s_operation_failed(&op) {
+                    return Err(K8sFailure::new(
+                        EXIT_APPLY_FAILURE,
+                        format!("operation {} terminated with failure", operation_id),
+                    ));
+                }
+                return Ok(());
+            }
+            let response = k8s_call(
+                client,
+                Method::GET,
+                &format!(
+                    "/api/k8s/applies/{}?cluster_id={}",
+                    operation_id,
+                    encode_query(&cluster_id)
+                ),
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| map_k8s_transport_or_auth(e, EXIT_APPLY_FAILURE))?;
+            k8s_emit_response(&response, json, false)?;
+            if k8s_operation_failed(&response) {
+                return Err(K8sFailure::new(
+                    EXIT_APPLY_FAILURE,
+                    format!("operation {} terminated with failure", operation_id),
+                ));
+            }
+            Ok(())
+        }
+        K8sCmd::Get { cmd } => match cmd {
+            K8sGetCmd::Resources {
+                cluster_id,
+                application,
+                kind,
+                include_secrets,
+                json,
+                non_interactive,
+            } => {
+                let _ = non_interactive;
+                let mut query = vec![format!("cluster_id={}", encode_query(&cluster_id))];
+                if let Some(v) = application {
+                    query.push(format!("application={}", encode_query(&v)));
+                }
+                if let Some(v) = kind {
+                    query.push(format!("kind={}", encode_query(&v)));
+                }
+                if let Some(v) = include_secrets {
+                    query.push(format!("include_secrets={}", v));
+                }
+                let path = format!("/api/k8s/resources?{}", query.join("&"));
+                let response = k8s_call(client, Method::GET, &path, None, None)
+                    .await
+                    .map_err(|e| map_k8s_transport_or_auth(e, EXIT_GENERIC_FAILURE))?;
+                k8s_emit_response(&response, json, false)?;
+                Ok(())
+            }
+            K8sGetCmd::Resource {
+                resource_id,
+                cluster_id,
+                json,
+                non_interactive,
+            } => {
+                let _ = non_interactive;
+                let path = format!(
+                    "/api/k8s/resources/{}?cluster_id={}",
+                    resource_id,
+                    encode_query(&cluster_id)
+                );
+                let response = k8s_call(client, Method::GET, &path, None, None)
+                    .await
+                    .map_err(|e| map_k8s_transport_or_auth(e, EXIT_GENERIC_FAILURE))?;
+                k8s_emit_response(&response, json, false)?;
+                Ok(())
+            }
+        },
+        K8sCmd::Delete {
+            resource_id,
+            cluster_id,
+            json,
+            non_interactive,
+        } => {
+            let _ = non_interactive;
+            let path = format!(
+                "/api/k8s/resources/{}?cluster_id={}",
+                resource_id,
+                encode_query(&cluster_id)
+            );
+            let response = k8s_call(client, Method::DELETE, &path, None, None)
+                .await
+                .map_err(|e| map_k8s_transport_or_auth(e, EXIT_APPLY_FAILURE))?;
+            if json {
+                print_json_value(&response)
+                    .map_err(|e| K8sFailure::new(EXIT_GENERIC_FAILURE, e.to_string()))?;
+            } else if response.as_object().map(|o| o.is_empty()).unwrap_or(false) {
+                println!(
+                    "{{\"deleted\":true,\"resource_id\":\"{}\",\"cluster_id\":\"{}\"}}",
+                    resource_id, cluster_id
+                );
+            } else {
+                k8s_emit_response(&response, false, false)?;
+            }
+            Ok(())
+        }
+        K8sCmd::Export {
+            cluster_id,
+            application,
+            output,
+            json,
+            non_interactive,
+        } => {
+            let _ = non_interactive;
+            let response = k8s_call(
+                client,
+                Method::POST,
+                "/api/k8s/export",
+                Some(serde_json::json!({
+                    "cluster_id": cluster_id,
+                    "application": application,
+                    "format": match output {
+                        K8sExportFormat::Yaml => "yaml",
+                        K8sExportFormat::Json => "json",
+                    }
+                })),
+                None,
+            )
+            .await
+            .map_err(|e| map_k8s_transport_or_auth(e, EXIT_GENERIC_FAILURE))?;
+            if json {
+                print_json_value(&response)
+                    .map_err(|e| K8sFailure::new(EXIT_GENERIC_FAILURE, e.to_string()))?;
+            } else {
+                match output {
+                    K8sExportFormat::Yaml => {
+                        if let Some(yaml) = response.get("output").and_then(|v| v.as_str()) {
+                            println!("{}", yaml);
+                        } else {
+                            print_json_value(&response).map_err(|e| {
+                                K8sFailure::new(EXIT_GENERIC_FAILURE, e.to_string())
+                            })?;
+                        }
+                    }
+                    K8sExportFormat::Json => {
+                        print_json_value(&response)
+                            .map_err(|e| K8sFailure::new(EXIT_GENERIC_FAILURE, e.to_string()))?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        K8sCmd::Capabilities {
+            json,
+            non_interactive,
+        } => {
+            let _ = non_interactive;
+            let response = k8s_call(client, Method::GET, "/api/k8s/capabilities", None, None)
+                .await
+                .map_err(|e| map_k8s_transport_or_auth(e, EXIT_GENERIC_FAILURE))?;
+            k8s_emit_response(&response, json, false)?;
+            Ok(())
+        }
+        K8sCmd::Schema {
+            json,
+            non_interactive,
+        } => {
+            let _ = non_interactive;
+            let response = k8s_call(client, Method::GET, "/api/k8s/schema", None, None)
+                .await
+                .map_err(|e| map_k8s_transport_or_auth(e, EXIT_GENERIC_FAILURE))?;
+            k8s_emit_response(&response, json, false)?;
+            Ok(())
+        }
+    }
+}
+
+async fn k8s_call(
+    client: &Client,
+    method: Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+    headers: Option<reqwest::header::HeaderMap>,
+) -> Result<serde_json::Value> {
+    let bytes = client
+        .send_json_bytes(method, path, headers.unwrap_or_default(), body)
+        .await?;
+    if bytes.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_slice(&bytes).context("Failed to parse backend JSON response")
+}
+
+fn k8s_emit_response(
+    v: &serde_json::Value,
+    json_mode: bool,
+    render_summary: bool,
+) -> std::result::Result<(), K8sFailure> {
+    if json_mode {
+        print_json_value(v).map_err(|e| K8sFailure::new(EXIT_GENERIC_FAILURE, e.to_string()))?;
+        return Ok(());
+    }
+
+    if render_summary {
+        print_k8s_summary(v);
+    }
+    print_k8s_messages(v);
+    print_json_value(v).map_err(|e| K8sFailure::new(EXIT_GENERIC_FAILURE, e.to_string()))
+}
+
+fn print_k8s_summary(v: &serde_json::Value) {
+    let mut counts: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    if let Some(resources) = v.get("resources").and_then(|x| x.as_array()) {
+        for r in resources {
+            let kind = r
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .unwrap_or("Unknown")
+                .to_string();
+            let action = r
+                .get("action")
+                .or_else(|| r.get("result"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            *counts.entry(kind).or_default().entry(action).or_default() += 1;
+        }
+    }
+    if let Some(summary) = v.get("summary").and_then(|x| x.as_object()) {
+        for (action, by_kind) in summary {
+            if let Some(kind_map) = by_kind.as_object() {
+                for (kind, n) in kind_map {
+                    if let Some(c) = n.as_u64() {
+                        *counts
+                            .entry(kind.to_string())
+                            .or_default()
+                            .entry(action.to_string())
+                            .or_default() += c;
+                    }
+                }
+            }
+        }
+    }
+    if counts.is_empty() {
+        return;
+    }
+    println!("summary:");
+    for (kind, actions) in counts {
+        let mut parts = Vec::new();
+        for (action, count) in actions {
+            parts.push(format!("{}={}", action, count));
+        }
+        println!("  {}: {}", kind, parts.join(", "));
+    }
+}
+
+fn print_k8s_messages(v: &serde_json::Value) {
+    if let Some(warnings) = v.get("warnings").and_then(|x| x.as_array()) {
+        for w in warnings {
+            print_backend_message("warning", w);
+        }
+    }
+    if let Some(errors) = v.get("errors").and_then(|x| x.as_array()) {
+        for e in errors {
+            print_backend_message("error", e);
+        }
+    }
+}
+
+fn print_backend_message(level: &str, value: &serde_json::Value) {
+    if let Some(obj) = value.as_object() {
+        let code = obj.get("code").and_then(|x| x.as_str()).unwrap_or("");
+        let field_path = obj.get("field_path").and_then(|x| x.as_str()).unwrap_or("");
+        let message = obj
+            .get("message")
+            .and_then(|x| x.as_str())
+            .unwrap_or_else(|| value.as_str().unwrap_or(""));
+        let hint = obj.get("hint").and_then(|x| x.as_str()).unwrap_or("");
+        let docs_url = obj.get("docs_url").and_then(|x| x.as_str()).unwrap_or("");
+        println!(
+            "{}: code={} field_path={} message={} hint={} docs_url={}",
+            level, code, field_path, message, hint, docs_url
+        );
+    } else if let Some(s) = value.as_str() {
+        println!("{}: {}", level, s);
+    } else {
+        println!("{}: {}", level, value);
+    }
+}
+
+fn k8s_has_warnings(v: &serde_json::Value) -> bool {
+    v.get("warnings")
+        .and_then(|x| x.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false)
+}
+
+fn k8s_operation_failed(v: &serde_json::Value) -> bool {
+    let status = v
+        .get("status")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    matches!(
+        status.as_str(),
+        "failed" | "error" | "cancelled" | "canceled"
+    )
+}
+
+fn extract_operation_id(v: &serde_json::Value) -> Option<String> {
+    v.get("operation_id")
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+}
+
+async fn k8s_wait_for_apply_operation(
+    client: &Client,
+    operation_id: &str,
+    cluster_id: &str,
+    timeout: Duration,
+) -> std::result::Result<serde_json::Value, K8sFailure> {
+    let started = std::time::Instant::now();
+    loop {
+        if started.elapsed() > timeout {
+            return Err(K8sFailure::new(
+                EXIT_APPLY_FAILURE,
+                format!("operation {} timed out after {:?}", operation_id, timeout),
+            ));
+        }
+        let value = k8s_call(
+            client,
+            Method::GET,
+            &format!(
+                "/api/k8s/applies/{}?cluster_id={}",
+                operation_id,
+                encode_query(cluster_id)
+            ),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| map_k8s_transport_or_auth(e, EXIT_APPLY_FAILURE))?;
+        let status = value
+            .get("status")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if matches!(
+            status.as_str(),
+            "succeeded" | "success" | "failed" | "error" | "cancelled" | "canceled"
+        ) {
+            return Ok(value);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn map_k8s_transport_or_auth(err: anyhow::Error, fallback: i32) -> K8sFailure {
+    let msg = err.to_string();
+    if is_transport_or_auth_error(&msg) {
+        return K8sFailure::new(EXIT_TRANSPORT_OR_AUTH_FAILURE, msg);
+    }
+    K8sFailure::new(fallback, msg)
+}
+
+fn is_transport_or_auth_error(msg: &str) -> bool {
+    msg.contains("status=401")
+        || msg.contains("status=403")
+        || msg.contains("status=407")
+        || msg.contains("Request failed")
+        || msg.contains("connection")
+        || msg.contains("timed out")
+        || msg.contains("dns")
+}
+
+#[derive(Debug, Clone)]
+struct ManifestSource {
+    content: String,
+}
+
+fn k8s_manifest_string(manifests: &[ManifestSource]) -> String {
+    manifests
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n---\n")
+}
+
+async fn collect_manifest_sources(inputs: &[String]) -> Result<Vec<ManifestSource>> {
+    let mut out = Vec::new();
+    for src in inputs {
+        if src.starts_with("http://") || src.starts_with("https://") {
+            let content = reqwest::get(src)
+                .await
+                .with_context(|| format!("Failed to fetch URL source {}", src))?
+                .error_for_status()
+                .with_context(|| format!("HTTP error fetching {}", src))?
+                .text()
+                .await
+                .with_context(|| format!("Failed to read URL response {}", src))?;
+            out.push(ManifestSource { content });
+            continue;
+        }
+
+        let path = PathBuf::from(src);
+        let meta = fs::metadata(&path).with_context(|| format!("Source not found: {}", src))?;
+        if meta.is_file() {
+            let content = read_manifest_file(&path)?;
+            out.push(ManifestSource { content });
+            continue;
+        }
+        if meta.is_dir() {
+            let files = collect_manifest_files_in_dir(&path)?;
+            for f in files {
+                let content = read_manifest_file(&f)?;
+                out.push(ManifestSource { content });
+            }
+            continue;
+        }
+        anyhow::bail!("Unsupported manifest source: {}", src);
+    }
+
+    if out.is_empty() {
+        anyhow::bail!("No manifest documents collected from inputs");
+    }
+    Ok(out)
+}
+
+fn collect_manifest_files_in_dir(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
+    let mut stack = vec![dir.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(current) = stack.pop() {
+        let mut entries = fs::read_dir(&current)
+            .with_context(|| format!("Failed to read directory {:?}", current))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for path in entries {
+            let meta = fs::metadata(&path)
+                .with_context(|| format!("Failed to read metadata for {:?}", path))?;
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if meta.is_file() && is_manifest_extension(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn is_manifest_extension(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension().and_then(|x| x.to_str()).unwrap_or(""),
+        "yaml" | "yml" | "json"
+    )
+}
+
+fn read_manifest_file(path: &std::path::Path) -> Result<String> {
+    let mut f = fs::File::open(path).with_context(|| format!("Failed to open {:?}", path))?;
+    let mut buf = String::new();
+    f.read_to_string(&mut buf)
+        .with_context(|| format!("Failed to read UTF-8 text from {:?}", path))?;
+    Ok(buf)
 }
 
 async fn run_request(
